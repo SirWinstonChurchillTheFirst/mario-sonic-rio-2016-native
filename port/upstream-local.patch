@@ -1,0 +1,491 @@
+diff --git a/recomp/src/rpx.cpp b/recomp/src/rpx.cpp
+index b445761..a8b0fe7 100644
+--- a/recomp/src/rpx.cpp
++++ b/recomp/src/rpx.cpp
+@@ -93,7 +93,7 @@ void apply_relocation(Image& image, const Relocation& relocation) {
+     const uint32_t place = relocation.offset;
+     const uint32_t width = relocation.type == kRPpcAddr32 ||
+                                    relocation.type == kRPpcRel24 ||
+-                                   relocation.type == kRPpcRel14
++                                   relocation.type == kRPpcRel14 || relocation.type == 109
+                                ? 4
+                                : 2;
+     if (!target.contains(place) || place - target.address + width > target.size ||
+@@ -136,6 +136,36 @@ void apply_relocation(Image& image, const Relocation& relocation) {
+                              (static_cast<uint32_t>(delta) & 0xFFFCu));
+         return;
+     }
++    // R_PPC_EMB_SDA21: the instruction addresses the symbol through its small-data base register: r13 for
++    // .sdata/.sbss, r2 for .sdata2/.sbss2. The register field and the 16-bit offset are both filled in.
++    case 109: {
++        const Symbol& symbol = image.symbols[relocation.symbol];
++        const std::string& home = symbol.section < image.sections.size() ? image.sections[symbol.section].name : "";
++        // The base the offset fits decides; where both fit, the section of the symbol does.
++        const int64_t from_sda = int64_t{value} - int64_t{image.file_info.sda_base};
++        const int64_t from_sda2 = int64_t{value} - int64_t{image.file_info.sda2_base};
++        const bool fits = from_sda >= -0x8000 && from_sda < 0x8000;
++        const bool fits2 = from_sda2 >= -0x8000 && from_sda2 < 0x8000;
++        if (!fits && !fits2) {
++            fail("SDA21 relocation out of range (symbol in " + home + ", value " + std::to_string(value) + ")");
++        }
++        const bool second = fits2 && (!fits || home == ".sdata2" || home == ".sbss2");
++        const int64_t delta = second ? from_sda2 : from_sda;
++        const uint32_t word = read_be32(data);
++        write_be32(data, (word & 0xFFE00000u) | ((second ? 2u : 13u) << 16) | (static_cast<uint32_t>(delta) & 0xFFFFu));
++        return;
++    }
++    // Green Hills position-relative halves (251 HA, 252 HI, 253 LO): the distance from the place to the symbol,
++    // as the Cafe loader applies them (Cemu RPLLoader: R_PPC_REL16_HA/HI/LO).
++    case 251:
++        write_be16(data, static_cast<uint16_t>((value - place + 0x8000) >> 16));
++        return;
++    case 252:
++        write_be16(data, static_cast<uint16_t>((value - place) >> 16));
++        return;
++    case 253:
++        write_be16(data, static_cast<uint16_t>(value - place));
++        return;
+     default:
+         fail("unsupported relocation type " + std::to_string(relocation.type));
+     }
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index dde7a63..8f0c541 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -64,8 +64,6 @@ add_library(cafe_runtime OBJECT
+     src/gpu/vulkan/targets.cpp
+     src/gpu/vulkan/textures.cpp
+     src/host/audio.cpp
+-    src/host/netplay.cpp
+-    src/host/rooms.cpp
+     src/host/display_settings.cpp
+     src/host/keymap.cpp
+     src/host/window.cpp
+diff --git a/runtime/include/cafe/export.h b/runtime/include/cafe/export.h
+index e257ea8..392c34e 100644
+--- a/runtime/include/cafe/export.h
++++ b/runtime/include/cafe/export.h
+@@ -54,24 +54,36 @@ namespace abi {
+ struct Cursor {
+     int gpr = 3;
+     int fpr = 1;
++    int stack = 0; // words taken from the caller's frame
+ };
+ 
++// The next integer argument word: r3..r10, then the caller's frame from 8(r1) on (PowerPC EABI).
++inline uint32_t next_word(PPCContext& ctx, Cursor& cursor) {
++    if (cursor.gpr <= 10) return ctx.r[cursor.gpr++];
++    return *guest<be<uint32_t>>(ctx.r[1] + 8 + 4 * static_cast<uint32_t>(cursor.stack++));
++}
++
+ template <typename T>
+ T read_arg(PPCContext& ctx, Cursor& cursor) {
+     if constexpr (std::is_same_v<T, GuestAddress>) {
+-        return GuestAddress{ctx.r[cursor.gpr++]};
++        return GuestAddress{next_word(ctx, cursor)};
+     } else if constexpr (std::is_pointer_v<T>) {
+-        return guest<std::remove_pointer_t<T>>(ctx.r[cursor.gpr++]);
++        return guest<std::remove_pointer_t<T>>(next_word(ctx, cursor));
+     } else if constexpr (std::is_floating_point_v<T>) {
+         return static_cast<T>(ctx.f[cursor.fpr++].ps0);
+     } else if constexpr (sizeof(T) == 8) {
++        // A 64-bit value takes an odd-even register pair, or (when none is left) an 8-aligned pair on the stack.
+         if ((cursor.gpr & 1) == 0) ++cursor.gpr;
+-        const uint64_t v = (uint64_t{ctx.r[cursor.gpr]} << 32) | ctx.r[cursor.gpr + 1];
+-        cursor.gpr += 2;
++        if (cursor.gpr > 9) {
++            cursor.gpr = 11;
++            cursor.stack += cursor.stack & 1;
++        }
++        const uint64_t high = next_word(ctx, cursor);
++        const uint64_t v = (high << 32) | next_word(ctx, cursor);
+         return static_cast<T>(v);
+     } else {
+         static_assert(std::is_integral_v<T> || std::is_enum_v<T>, "unsupported argument type");
+-        return static_cast<T>(ctx.r[cursor.gpr++]);
++        return static_cast<T>(next_word(ctx, cursor));
+     }
+ }
+ 
+diff --git a/runtime/src/gpu/command_processor.cpp b/runtime/src/gpu/command_processor.cpp
+index eff48db..c211eed 100644
+--- a/runtime/src/gpu/command_processor.cpp
++++ b/runtime/src/gpu/command_processor.cpp
+@@ -183,7 +183,7 @@ void execute(uint32_t address, uint32_t words, int depth);
+ // the GPU, in command order, on a thread of its own; meanwhile the command
+ // processor goes on with the next commands, as the console's does.
+ struct Retirement {
+-    enum Kind : uint8_t { kTimestamp, kWrite32, kWrite64, kWriteClock } kind;
++    enum Kind : uint8_t { kTimestamp, kWrite32, kWrite64, kWriteClock, kInterrupt } kind;
+     uint64_t done;     // the backend's completion value (Backend::flush)
+     uint32_t address;
+     uint64_t data;
+@@ -216,6 +216,7 @@ void retirement_main() {
+         case Retirement::kWrite32: wr32(r.address, static_cast<uint32_t>(r.data)); break;
+         case Retirement::kWrite64: wr64(r.address, r.data); break;
+         case Retirement::kWriteClock: wr64(r.address, clock()); break;
++        case Retirement::kInterrupt: fire_event(1); break; // GX2's end-of-pipe interrupt callback
+         }
+     }
+ }
+@@ -387,6 +388,8 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
+         case 3: retire_later({Retirement::kWriteClock, g_backend->flush(), target, 0}); break;
+         default: break;
+         }
++        // INT_SEL: the end-of-pipe interrupt, after the write above has retired.
++        if ((arg(2) >> 24) & 3) retire_later({Retirement::kInterrupt, g_backend->flush(), 0, 0});
+         break;
+     }
+     case pm4::kMemWrite: {
+diff --git a/runtime/src/gpu/display.cpp b/runtime/src/gpu/display.cpp
+index a91815d..dfb51a7 100644
+--- a/runtime/src/gpu/display.cpp
++++ b/runtime/src/gpu/display.cpp
+@@ -8,6 +8,12 @@
+ #include "gpu/gpu.h"
+ #include "os/kernel.h"
+ 
++#include <condition_variable>
++#include <mutex>
++#include <pthread.h>
++#include "cafe/export.h"
++#include <cstdio>
++#include <cstdlib>
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
+@@ -30,7 +36,54 @@ uint64_t g_vsyncs = 0;
+ uint64_t g_last_flip_vsync = 0;
+ uint32_t g_swap_interval = 1;
+ 
++constexpr uint32_t kEventTypes = 5;
++struct EventCallback {
++    uint32_t function = 0, data = 0;
++};
++std::mutex g_event_mutex;
++std::condition_variable g_event_ready;
++EventCallback g_event_callbacks[kEventTypes];
++uint32_t g_event_pending[kEventTypes] = {};
++os::Thread* g_event_thread = nullptr;
++
++void* event_main(void*) {
++    os::Thread* t = g_event_thread;
++    os::bind_current_thread(t);
++    for (;;) {
++        uint32_t type = 0;
++        EventCallback callback;
++        {
++            std::unique_lock lock(g_event_mutex);
++            g_event_ready.wait(lock, [] {
++                for (uint32_t pending : g_event_pending) {
++                    if (pending) return true;
++                }
++                return false;
++            });
++            while (g_event_pending[type] == 0) ++type;
++            --g_event_pending[type];
++            callback = g_event_callbacks[type];
++        }
++        if (callback.function == 0) continue;
++        os::KernelLock lock(os::kernel_mutex());
++        os::acquire_interrupt_lock(lock, t);
++        lock.unlock();
++        static const bool trace = std::getenv("TTT2_TRACE_EVENTS") != nullptr;
++        static int traced = 0;
++        if (trace && type < 2 && traced < 12) {
++            ++traced;
++            std::fprintf(stderr, "ttt2: gx2: event %u calls 0x%08X\n", type, callback.function);
++        }
++        call_guest(t->ctx, callback.function, {type, callback.data});
++        lock.lock();
++        bool held = false;
++        os::release_interrupt_lock_for_wait(t, held);
++    }
++    return nullptr;
++}
++
+ void flip(uint64_t now) {
++    fire_event(3);
+     ++g_flips;
+     g_last_flip = now;
+     g_last_flip_vsync = g_vsyncs;
+@@ -46,6 +99,7 @@ int64_t steady_ns() {
+ }
+ 
+ void vsync_locked() {
++    fire_event(2);
+     const uint64_t now = cafe_ppc_timebase();
+     ++g_vsyncs;
+     g_last_vsync = now;
+@@ -80,6 +134,38 @@ void display_main() {
+ 
+ } // namespace
+ 
++void set_event_callback(uint32_t type, uint32_t function, uint32_t data) {
++    std::fprintf(stderr, "ttt2: gx2: event callback %u = 0x%08X (data 0x%08X)\n", type, function, data);
++    if (type >= kEventTypes) return;
++    std::lock_guard lock(g_event_mutex);
++    g_event_callbacks[type] = {function, data};
++    if (function != 0 && g_event_thread == nullptr) {
++        g_event_thread = os::create_internal_thread("cafe gx2 events", 0);
++        pthread_t host;
++        pthread_attr_t attr;
++        pthread_attr_init(&attr);
++        pthread_attr_setstacksize(&attr, 64u << 20);
++        pthread_create(&host, &attr, event_main, nullptr);
++        pthread_attr_destroy(&attr);
++        pthread_detach(host);
++    }
++}
++
++void fire_event(uint32_t type) {
++    if (type >= kEventTypes) return;
++    std::lock_guard lock(g_event_mutex);
++    if (g_event_callbacks[type].function == 0) return;
++    static const bool trace = std::getenv("TTT2_TRACE_EVENTS") != nullptr;
++    static int traced = 0;
++    if (trace && type < 2 && traced < 12) {
++        ++traced;
++        std::fprintf(stderr, "ttt2: gx2: event queued %u\n", type);
++    }
++    // A callback that falls behind is not owed every blank it missed.
++    if (type < 2 || g_event_pending[type] < 2) ++g_event_pending[type]; // interrupts (0, 1) are each owed
++    g_event_ready.notify_one();
++}
++
+ void host_vsync(uint32_t count) {
+     os::KernelLock lock(os::kernel_mutex());
+     g_last_host_vsync.store(steady_ns());
+diff --git a/runtime/src/gpu/gpu.h b/runtime/src/gpu/gpu.h
+index 7c1b5ee..e90ac00 100644
+--- a/runtime/src/gpu/gpu.h
++++ b/runtime/src/gpu/gpu.h
+@@ -101,6 +101,11 @@ void forget_timer_vsyncs();
+ // The host's blanks stop (presentation no longer follows the display): the
+ // timer stands in from its next period.
+ void host_vsync_stopped();
++
++// GX2 event callbacks (GX2SetEventCallback): callback(type, data) on a guest thread of its own, with interrupts
++// off as on the console. fire_event queues one call; it never blocks and may be called under any lock.
++void set_event_callback(uint32_t type, uint32_t function, uint32_t data);
++void fire_event(uint32_t type);
+ void set_swap_interval(uint32_t interval);
+ uint32_t swap_interval();
+ 
+diff --git a/runtime/src/gx2/cbpool.cpp b/runtime/src/gx2/cbpool.cpp
+index 09327e6..699483d 100644
+--- a/runtime/src/gx2/cbpool.cpp
++++ b/runtime/src/gx2/cbpool.cpp
+@@ -295,6 +295,13 @@ void GX2DirectCallDisplayList(uint32_t list, uint32_t bytes) {
+     direct_call_display_list(list, bytes);
+ }
+ bool GX2GetDisplayListWriteStatus() { return t_recording; }
++// The list this thread is recording: its buffer and size in bytes. False when none is being recorded.
++bool GX2GetCurrentDisplayList(be<uint32_t>* list, be<uint32_t>* bytes) {
++    if (!t_recording) return false;
++    if (list) *list = t_display_list.base;
++    if (bytes) *bytes = t_display_list.size * 4;
++    return true;
++}
+ 
+ } // namespace
+ 
+@@ -311,5 +318,6 @@ CAFE_EXPORT(gx2, GX2EndDisplayList, GX2EndDisplayList);
+ CAFE_EXPORT(gx2, GX2CallDisplayList, GX2CallDisplayList);
+ CAFE_EXPORT(gx2, GX2DirectCallDisplayList, GX2DirectCallDisplayList);
+ CAFE_EXPORT(gx2, GX2GetDisplayListWriteStatus, GX2GetDisplayListWriteStatus);
++CAFE_EXPORT(gx2, GX2GetCurrentDisplayList, GX2GetCurrentDisplayList);
+ 
+ } // namespace cafe::gx2
+diff --git a/runtime/src/gx2/display.cpp b/runtime/src/gx2/display.cpp
+index 75aaf53..311d0a4 100644
+--- a/runtime/src/gx2/display.cpp
++++ b/runtime/src/gx2/display.cpp
+@@ -15,6 +15,7 @@
+ #include "cafe/sysmem.h"
+ 
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ 
+ namespace cafe::gx2 {
+@@ -199,15 +200,26 @@ void GX2SampleBottomGPUCycle(be<uint64_t>* out) {
+ uint64_t GX2GPUTimeToCPUTime(uint64_t time) { return time; }
+ 
+ // GX2PipeEvent: top of pipe, bottom of pipe, bottom after cache flush.
+-void GX2SubmitUserTimeStamp(be<uint64_t>* out, uint64_t value, uint32_t event, bool) {
++void GX2SubmitUserTimeStamp(be<uint64_t>* out, uint64_t value, uint32_t event, bool interrupt) {
+     ApiLock lock;
++    static const bool trace = std::getenv("TTT2_TRACE_EVENTS") != nullptr;
++    static int traced = 0;
++    if (trace && traced < 8) {
++        ++traced;
++        std::fprintf(stderr, "ttt2: gx2: user timestamp 0x%llX to 0x%08X, pipe event %u, interrupt %d\n",
++                     static_cast<unsigned long long>(value), guest_address(out), event, interrupt);
++    }
+     const uint32_t address = guest_address(out) | endian::k8In64;
+-    const uint32_t lo = static_cast<uint32_t>(value), hi = static_cast<uint32_t>(value >> 32);
++    static const bool swap = std::getenv("TTT2_TS_HIGH_FIRST") == nullptr;
++    const uint32_t lo = static_cast<uint32_t>(swap ? value >> 32 : value);
++    const uint32_t hi = static_cast<uint32_t>(swap ? value : value >> 32);
+     if (event == 0) {
+         write_packet(pm4::kMemWrite, {address, 0, lo, hi});
+     } else {
+         const uint32_t type = event == 2 ? pm4::kEventCacheFlushAndInvTs : pm4::kEventBottomOfPipeTs;
+-        write_packet(pm4::kEventWriteEop, {type | pm4::kEventIndexTs, address, pm4::kEopData64, lo, hi});
++        // INT_SEL (bits 24-25 of the third word): the end-of-pipe interrupt once the data is written.
++        write_packet(pm4::kEventWriteEop,
++                     {type | pm4::kEventIndexTs, address, pm4::kEopData64 | (interrupt ? 2u << 24 : 0u), lo, hi});
+     }
+ }
+ 
+@@ -225,8 +237,11 @@ void GX2MarkScanBufferCopied(uint32_t) {}
+ // The GamePad never connects or disconnects: no callback to make. Returns
+ // the previous callback, none.
+ uint32_t GX2SetDRCConnectCallback(uint32_t, uint32_t) { return 0; }
+-// shortcut: event callbacks (vsync, flip, ...) are accepted and never called; call them if the title waits on them.
+-void GX2SetEventCallback(uint32_t, uint32_t, uint32_t) {}
++// Event callbacks (GX2EventType: 0/1 start/end-of-pipe interrupt, 2 vsync, 3 flip, 4 display list overrun) are
++// called by the display and the command processor (gpu/display.cpp); 0 and 4 never happen here.
++void GX2SetEventCallback(uint32_t type, uint32_t function, uint32_t data) {
++    gpu::set_event_callback(type, function, data);
++}
+ void GX2DebugTagUserString(uint32_t, uint32_t) {}
+ 
+ } // namespace
+diff --git a/runtime/src/gx2/surface.cpp b/runtime/src/gx2/surface.cpp
+index e403aff..431bb4f 100644
+--- a/runtime/src/gx2/surface.cpp
++++ b/runtime/src/gx2/surface.cpp
+@@ -442,6 +442,24 @@ void GX2CopySurface(Surface* src, uint32_t src_level, uint32_t src_slice, Surfac
+         .write();
+ }
+ 
++// GX2CopySurfaceEx: `count` rectangles {left, top, right, bottom} of the source level, each to a point {x, y} of
++// the destination level. One rectangle covering the whole level, to (0, 0), is GX2CopySurface; a partial copy is
++// not written yet and stops with its numbers rather than copying the wrong area.
++void GX2CopySurfaceEx(Surface* src, uint32_t src_level, uint32_t src_slice, Surface* dst, uint32_t dst_level,
++                      uint32_t dst_slice, uint32_t count, const be<int32_t>* rects, const be<int32_t>* points) {
++    const int32_t width = static_cast<int32_t>(std::max(uint32_t{src->width} >> src_level, 1u));
++    const int32_t height = static_cast<int32_t>(std::max(uint32_t{src->height} >> src_level, 1u));
++    for (uint32_t i = 0; i < count; ++i) {
++        const int32_t left = rects[i * 4], top = rects[i * 4 + 1], right = rects[i * 4 + 2], bottom = rects[i * 4 + 3];
++        const int32_t x = points[i * 2], y = points[i * 2 + 1];
++        if (left != 0 || top != 0 || right != width || bottom != height || x != 0 || y != 0) {
++            fatal("GX2CopySurfaceEx: partial copy (%d,%d)-(%d,%d) of %dx%d to (%d,%d) is not implemented yet", left, top,
++                  right, bottom, width, height, x, y);
++        }
++        GX2CopySurface(src, src_level, src_slice, dst, dst_level, dst_slice);
++    }
++}
++
+ void GX2ResolveAAColorBuffer(ColorBuffer* src, Surface* dst, uint32_t dst_level, uint32_t dst_slice) {
+     if (src->surface.format == 0u || src->surface.width == 0u || dst->format == 0u) return;
+     ApiLock lock;
+@@ -535,6 +553,7 @@ CAFE_EXPORT(gx2, GX2CalcDepthBufferHiZInfo, GX2CalcDepthBufferHiZInfo);
+ CAFE_EXPORT(gx2, GX2SetColorBuffer, GX2SetColorBuffer);
+ CAFE_EXPORT(gx2, GX2SetDepthBuffer, GX2SetDepthBuffer);
+ CAFE_EXPORT(gx2, GX2CopySurface, GX2CopySurface);
++CAFE_EXPORT(gx2, GX2CopySurfaceEx, GX2CopySurfaceEx);
+ CAFE_EXPORT(gx2, GX2ResolveAAColorBuffer, GX2ResolveAAColorBuffer);
+ CAFE_EXPORT(gx2, GX2ExpandDepthBuffer, GX2ExpandDepthBuffer);
+ CAFE_EXPORT(gx2, GX2ConvertDepthBufferToTextureSurface, GX2ConvertDepthBufferToTextureSurface);
+diff --git a/runtime/src/os/fs.cpp b/runtime/src/os/fs.cpp
+index 404cc34..4724021 100644
+--- a/runtime/src/os/fs.cpp
++++ b/runtime/src/os/fs.cpp
+@@ -334,6 +334,56 @@ int32_t FSGetStatAsync(PPCContext& ctx, GuestAddress client, GuestAddress block,
+                        uint32_t mask, const be<uint32_t>* async) {
+     return complete_async(ctx, client, block, FSGetStat(client, block, path, out, mask), async);
+ }
++int32_t FSGetPosFile(GuestAddress client, GuestAddress, int32_t handle, be<uint32_t>* position, uint32_t mask) {
++    uint64_t at = 0;
++    const auto status = vfs::tell_file(handle, at);
++    if (status == vfs::kOk && position) *position = static_cast<uint32_t>(at);
++    return finish(client, status, mask, "tell");
++}
++// FS_STATUS_END at the end of the file, else FS_STATUS_OK.
++int32_t FSIsEof(GuestAddress client, GuestAddress, int32_t handle, uint32_t mask) {
++    uint64_t at = 0;
++    vfs::Stat stat;
++    auto status = vfs::tell_file(handle, at);
++    if (status == vfs::kOk) status = vfs::stat_file(handle, stat);
++    if (status == vfs::kOk && at >= stat.size) status = vfs::kEnd;
++    return finish(client, status, mask, "eof");
++}
++// FSVolumeState: 1 = ready (the game's volume is always there).
++int32_t FSGetVolumeState(GuestAddress) { return 1; }
++
++int32_t FSReadFileAsync(PPCContext& ctx, GuestAddress client, GuestAddress block, uint8_t* destination, uint32_t size,
++                        uint32_t count, int32_t handle, uint32_t flags, uint32_t mask, const be<uint32_t>* async) {
++    return complete_async(ctx, client, block, FSReadFile(client, block, destination, size, count, handle, flags, mask), async);
++}
++int32_t FSReadFileWithPosAsync(PPCContext& ctx, GuestAddress client, GuestAddress block, uint8_t* destination,
++                               uint32_t size, uint32_t count, uint32_t position, int32_t handle, uint32_t flags,
++                               uint32_t mask, const be<uint32_t>* async) {
++    return complete_async(ctx, client, block,
++                          FSReadFileWithPos(client, block, destination, size, count, position, handle, flags, mask), async);
++}
++int32_t FSWriteFileAsync(PPCContext& ctx, GuestAddress client, GuestAddress block, const uint8_t* source, uint32_t size,
++                         uint32_t count, int32_t handle, uint32_t flags, uint32_t mask, const be<uint32_t>* async) {
++    return complete_async(ctx, client, block, FSWriteFile(client, block, source, size, count, handle, flags, mask), async);
++}
++int32_t FSWriteFileWithPosAsync(PPCContext& ctx, GuestAddress client, GuestAddress block, const uint8_t* source,
++                                uint32_t size, uint32_t count, uint32_t position, int32_t handle, uint32_t flags,
++                                uint32_t mask, const be<uint32_t>* async) {
++    return complete_async(ctx, client, block,
++                          FSWriteFileWithPos(client, block, source, size, count, position, handle, flags, mask), async);
++}
++int32_t FSGetPosFileAsync(PPCContext& ctx, GuestAddress client, GuestAddress block, int32_t handle,
++                          be<uint32_t>* position, uint32_t mask, const be<uint32_t>* async) {
++    return complete_async(ctx, client, block, FSGetPosFile(client, block, handle, position, mask), async);
++}
++int32_t FSSetPosFileAsync(PPCContext& ctx, GuestAddress client, GuestAddress block, int32_t handle, uint32_t position,
++                          uint32_t mask, const be<uint32_t>* async) {
++    return complete_async(ctx, client, block, FSSetPosFile(client, block, handle, position, mask), async);
++}
++int32_t FSGetStatFileAsync(PPCContext& ctx, GuestAddress client, GuestAddress block, int32_t handle, uint8_t* out,
++                           uint32_t mask, const be<uint32_t>* async) {
++    return complete_async(ctx, client, block, FSGetStatFile(client, block, handle, out, mask), async);
++}
+ // The FSAsyncResult of a completion message from a queue: the message's data word.
+ uint32_t FSGetAsyncResult(const be<uint32_t>* message) { return message ? uint32_t{message[0]} : 0u; }
+ // Writes go to the host file as they happen; nothing waits in a cache.
+@@ -407,6 +457,16 @@ CAFE_EXPORT(coreinit, FSOpenFileAsync, FSOpenFileAsync);
+ CAFE_EXPORT(coreinit, FSCloseFileAsync, FSCloseFileAsync);
+ CAFE_EXPORT(coreinit, FSGetStatAsync, FSGetStatAsync);
+ CAFE_EXPORT(coreinit, FSGetAsyncResult, FSGetAsyncResult);
++CAFE_EXPORT(coreinit, FSGetPosFile, FSGetPosFile);
++CAFE_EXPORT(coreinit, FSIsEof, FSIsEof);
++CAFE_EXPORT(coreinit, FSGetVolumeState, FSGetVolumeState);
++CAFE_EXPORT(coreinit, FSReadFileAsync, FSReadFileAsync);
++CAFE_EXPORT(coreinit, FSReadFileWithPosAsync, FSReadFileWithPosAsync);
++CAFE_EXPORT(coreinit, FSWriteFileAsync, FSWriteFileAsync);
++CAFE_EXPORT(coreinit, FSWriteFileWithPosAsync, FSWriteFileWithPosAsync);
++CAFE_EXPORT(coreinit, FSGetPosFileAsync, FSGetPosFileAsync);
++CAFE_EXPORT(coreinit, FSSetPosFileAsync, FSSetPosFileAsync);
++CAFE_EXPORT(coreinit, FSGetStatFileAsync, FSGetStatFileAsync);
+ CAFE_EXPORT(coreinit, FSFlushFile, FSFlushFile);
+ CAFE_EXPORT(coreinit, FSRemove, FSRemove);
+ CAFE_EXPORT(coreinit, FSRename, FSRename);
+diff --git a/runtime/src/os/heap.cpp b/runtime/src/os/heap.cpp
+index 552bb84..76aa16d 100644
+--- a/runtime/src/os/heap.cpp
++++ b/runtime/src/os/heap.cpp
+@@ -324,6 +324,16 @@ void MEMFreeToAllocator(PPCContext& ctx, GuestAddress allocator, uint32_t block)
+     call_guest(ctx, *guest<be<uint32_t>>(functions + 4), {allocator.value, block});
+ }
+ 
++// MEMFreeToFrmHeap: bit 0 of the mode gives back everything taken from the head, bit 1 from the tail.
++static void MEMFreeToFrmHeap(uint32_t handle, uint32_t mode) {
++    std::lock_guard lock(g_heap_mutex);
++    const auto it = g_frame_heaps.find(handle);
++    if (it == g_frame_heaps.end()) fatal("0x%08X is not a frame heap", handle);
++    if (mode & 1) it->second->head = it->second->begin;
++    if (mode & 2) it->second->tail = it->second->end;
++}
++CAFE_EXPORT(coreinit, MEMFreeToFrmHeap, MEMFreeToFrmHeap);
++
+ CAFE_EXPORT(coreinit, MEMGetBaseHeapHandle, MEMGetBaseHeapHandle);
+ CAFE_EXPORT(coreinit, MEMGetTotalFreeSizeForExpHeap, MEMGetTotalFreeSizeForExpHeap);
+ CAFE_EXPORT(coreinit, MEMSetAllocModeForExpHeap, MEMSetAllocModeForExpHeap);
