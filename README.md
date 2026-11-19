@@ -12,13 +12,13 @@ translated to C++ ahead of time and runs on a reimplementation of the Wii U's sy
 | Step | State |
 | --- | --- |
 | Translate `unison.rpx` (84,281 functions, 4.87 million instructions) | works |
-| Build with the runtime | works (Linux; Windows not tried) |
+| Build with the runtime | works on Windows (clang, MSYS2) and Linux |
 | Start-up, Rio 2016 logo and copyright screen | shown correctly |
 | Autosave notice, accepted with A | works (text needs a system font, see below) |
 | "Now loading..." after the title | reached, then the game stops with a null access (guest address 0x4, at `0x0215B4FC`) |
 | Menus, events, gameplay | **not reached** |
 | Sound | a device is opened; nothing has been listened to. Reverb, chorus and delay effects are not computed |
-| Speed | not measured: tested only on a software Vulkan renderer (about 11 frames/s) |
+| Speed | on a GeForce RTX 3070 Ti (Windows build) the renderer needs 1.3 to 2.9 ms per frame up to the loading picture |
 
 Known gaps: the game asks for the console's Mii data files (`FFLResMiddle.dat`, `FFLResHigh.dat`), which are not
 part of a game dump; `GX2ResetGPU` does nothing; `GX2CopySurfaceEx` copies whole surfaces only; online services
