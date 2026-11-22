@@ -7,15 +7,23 @@ translated to C++ ahead of time and runs on a reimplementation of the Wii U's sy
 > unpacked to `code/`, `content/`, `meta/`. The translated C++ and the program built from it contain the game's
 > code: do not share them. Not affiliated with or endorsed by Nintendo, SEGA or the IOC.
 
-## Status (22 November 2026): hub town, menus and character select run, 60 frames/s on a Batocera console
+## Status (22 November 2026, evening): playable, events run at 60 frames/s on a Batocera console
 
 | Step | State |
 | --- | --- |
 | Logo, save notice, map, "Now loading...", the hub town (Copacabana) with your Mii walking, dialogs | works (PC and console) |
 | Discipline and character select | works |
-| An event (match) | **not verified**: two of seven PC test runs ended in a guest fault inside the title's multi-threaded renderer (`hh::rsdx`, null or wild shader-parameter pointer), likely a threading race; the console run (160 s, menus) had none |
-| Speed | console (Ryzen 3 4350GE, Vega 6): 59.9 frames/s in the menus; CPU 71 C, GPU 61 C |
+| An event | works: a football duel played through on the PC and twice on the console (220 s and 280 s), no crash |
+| Speed | console (Ryzen 3 4350GE, Vega 6): 54-60 frames/s in events, 30 in the hub town; CPU max 76 C, GPU max 67 C |
 | Sound | works |
+
+**The crash is fixed.** The game's renderer (`hh::rsdx`) hands out memory from lock-free lists built on
+`lwarx`/`stwcx.`. The runtime emulated that pair as a bare compare-and-swap on the value, which has the ABA problem:
+another thread could take the head entry and the next one and put the head back in between, the swap still
+succeeded and an entry in use was handed out again (null shaders, wild pointers, an assertion in
+`RsdxAtomicPopSList`). `port/patch_reservation.py` gives every `stwcx.` a reservation: a version counter per
+32-byte line, bumped by every `stwcx.`, which makes a `stwcx.` fail when another thread stored there since its
+`lwarx`, as on the hardware.
 
 **Miis.** The game needs the Wii U's Mii resources (system title `0005001B-10056000`: `FFLResMiddle.dat`,
 `FFLResHigh.dat`). They are **not** part of the game and **not** included here: visible Miis need the Mii resource

@@ -275,11 +275,75 @@ index e257ea8..392c34e 100644
      }
  }
  
+diff --git a/runtime/include/cafe/ppc_context.h b/runtime/include/cafe/ppc_context.h
+index a50d86d..6fe1d9c 100644
+--- a/runtime/include/cafe/ppc_context.h
++++ b/runtime/include/cafe/ppc_context.h
+@@ -29,6 +29,7 @@ struct alignas(64) PPCContext {
+     uint32_t reserve_address;
+     uint32_t reserve_value; // raw big-endian word observed by lwarx
+     uint8_t reserve_valid;
++    uint32_t reserve_version; // port/patch_reservation.py: line version seen by lwarx
+     void* host_thread; // owned by the runtime
+ };
+ 
+diff --git a/runtime/include/cafe/ppc_ops.h b/runtime/include/cafe/ppc_ops.h
+index b4c15d8..ee32cdf 100644
+--- a/runtime/include/cafe/ppc_ops.h
++++ b/runtime/include/cafe/ppc_ops.h
+@@ -150,8 +150,12 @@ inline void stsw(const PPCContext& ctx, uint8_t* base, uint32_t rs, uint32_t ea,
+     }
+ }
+ 
+-// lwarx/stwcx. as a compare-and-swap on the observed word.
++// lwarx/stwcx. as a compare-and-swap on the observed word, guarded by a version per reservation line
++// (port/patch_reservation.py): a stwcx. by another thread in between makes ours fail, as on hardware.
++extern uint32_t g_reserve_lines[4096];
++inline uint32_t* reserve_line(uint32_t ea) { return &g_reserve_lines[((ea >> 5) ^ (ea >> 17)) & 4095u]; }
+ inline uint32_t lwarx(PPCContext& ctx, const uint8_t* base, uint32_t ea) {
++    ctx.reserve_version = __atomic_load_n(reserve_line(ea), __ATOMIC_ACQUIRE);
+     uint32_t raw;
+     __atomic_load(reinterpret_cast<const uint32_t*>(base + ea), &raw,
+                   __ATOMIC_SEQ_CST);
+@@ -166,11 +170,21 @@ inline bool stwcx(PPCContext& ctx, uint8_t* base, uint32_t ea, uint32_t value) {
+     if (!held) {
+         return false;
+     }
++    uint32_t version = ctx.reserve_version;
++    if (version & 1u) {
++        return false; // lwarx saw another stwcx. in progress
++    }
++    uint32_t* const line = reserve_line(ea);
++    if (!__atomic_compare_exchange_n(line, &version, version + 1u, false, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
++        return false; // another stwcx. to this line since our lwarx
++    }
+     uint32_t expected = ctx.reserve_value;
+-    return __atomic_compare_exchange_n(reinterpret_cast<uint32_t*>(base + ea),
+-                                       &expected, __builtin_bswap32(value),
+-                                       false, __ATOMIC_SEQ_CST,
+-                                       __ATOMIC_SEQ_CST);
++    const bool stored = __atomic_compare_exchange_n(reinterpret_cast<uint32_t*>(base + ea),
++                                                    &expected, __builtin_bswap32(value),
++                                                    false, __ATOMIC_SEQ_CST,
++                                                    __ATOMIC_SEQ_CST);
++    __atomic_store_n(line, ctx.reserve_version + 2u, __ATOMIC_RELEASE);
++    return stored;
+ }
+ 
+ // ---------------------------------------------------------------------------
 diff --git a/runtime/include/cafe/runtime.h b/runtime/include/cafe/runtime.h
-index 49e556a..7888f31 100644
+index 49e556a..a61c2d4 100644
 --- a/runtime/include/cafe/runtime.h
 +++ b/runtime/include/cafe/runtime.h
-@@ -41,6 +41,8 @@ std::string sha256_hex(const std::vector<uint8_t>& data);
+@@ -11,6 +11,7 @@
+ #include <vector>
+ 
+ namespace cafe {
++extern void (*g_fault_threads_hook)(const PPCContext*); // port/patch_fault_threads.py
+ 
+ // ---------------------------------------------------------------- memory
+ // One 4 GiB host reservation mirrors the guest address space. Only committed
+@@ -41,6 +42,8 @@ std::string sha256_hex(const std::vector<uint8_t>& data);
  
  // ---------------------------------------------------------------- dispatch
  void build_dispatch_table();
@@ -289,7 +353,7 @@ index 49e556a..7888f31 100644
  // guest stores and calls, e.g. MEMAllocFromDefaultHeap's value).
  uint32_t register_host_function(PPCFunc* function, const char* name);
 diff --git a/runtime/src/diagnostics.cpp b/runtime/src/diagnostics.cpp
-index b5cbc80..d0dc937 100644
+index b5cbc80..8e32e80 100644
 --- a/runtime/src/diagnostics.cpp
 +++ b/runtime/src/diagnostics.cpp
 @@ -1,3 +1,4 @@
@@ -297,7 +361,29 @@ index b5cbc80..d0dc937 100644
  #include "cafe/generated.h"
  #include "cafe/ppc_ops.h"
  #include "cafe/runtime.h"
-@@ -234,6 +235,14 @@ void cafe_unimplemented_import(cafe::PPCContext& ctx, const char* module, const
+@@ -89,10 +90,21 @@ void report_fault(uintptr_t host, int signal) {
+     }
+ }
+ 
++} // namespace
++void (*g_fault_threads_hook)(const PPCContext*) = nullptr; // port/patch_fault_threads.py, set by os/thread.cpp
++namespace {
++
+ void report_guest_state_and_exit(int signal) {
+     if (t_current != nullptr) {
+         print_guest_state(*t_current);
+     }
++    if (g_fault_threads_hook != nullptr) {
++        static const bool on = [] {
++            const char* v = std::getenv("TTT2_FAULT_THREADS");
++            return v == nullptr || *v != '0';
++        }();
++        if (on) g_fault_threads_hook(t_current);
++    }
+     std::fflush(stderr);
+     std::_Exit(128 + signal);
+ }
+@@ -234,6 +246,14 @@ void cafe_unimplemented_import(cafe::PPCContext& ctx, const char* module, const
      // would. Constructors and destructors leave their object in r3, queries
      // answer 0, everything else fails with an nn::Result.
      const std::string_view m = module, n = name;
@@ -645,8 +731,34 @@ index 7c1b5ee..bb0ac5a 100644
  void set_swap_interval(uint32_t interval);
  uint32_t swap_interval();
  
+diff --git a/runtime/src/gpu/vulkan/context.cpp b/runtime/src/gpu/vulkan/context.cpp
+index 31bfd45..cceebee 100644
+--- a/runtime/src/gpu/vulkan/context.cpp
++++ b/runtime/src/gpu/vulkan/context.cpp
+@@ -367,9 +367,19 @@ void GuestMemory::init(Context& c) {
+     const Range ranges[] = {{layout::kMem2Base, layout::kMem2End - layout::kMem2Base},
+                             {layout::kMem1Base, layout::kMem1Size}};
+     for (const Range& r : ranges) {
+-        // Import the committed part from the region's start.
++        // Import the committed part from the region's start, up to its last committed 64 KiB; holes in between
++        // (an extra module's data placed after a gap) are committed so the import is one piece
++        // (port/patch_import_gaps.py).
+         uint32_t size = 0;
+-        while (size < r.size && guest_memory_committed(r.base + size, 0x10000)) size += 0x10000;
++        for (uint32_t off = 0; off < r.size; off += 0x10000) {
++            if (guest_memory_committed(r.base + off, 0x10000)) size = off + 0x10000;
++        }
++        for (uint32_t off = 0; off < size; off += 0x10000) {
++            if (!guest_memory_committed(r.base + off, 0x10000)) {
++                std::fprintf(stderr, "ttt2: GPU: committing hole 0x%08X for the import\n", r.base + off);
++                commit_guest_memory(r.base + off, 0x10000);
++            }
++        }
+         if (size == 0) continue;
+         void* host = guest_pointer(r.base);
+         VkMemoryHostPointerPropertiesEXT props{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
 diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
-index d591259..985285c 100644
+index d591259..e508b89 100644
 --- a/runtime/src/gpu/vulkan/draw.cpp
 +++ b/runtime/src/gpu/vulkan/draw.cpp
 @@ -2,6 +2,7 @@
@@ -690,16 +802,83 @@ index d591259..985285c 100644
      case 0x14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuadStrip; break;
      default:
          report_once("unsupported primitive type", r(reg::VGT_PRIMITIVE_TYPE));
-@@ -762,7 +771,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -762,13 +771,40 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      // Render targets.
      std::array<const Target*, 8> colors{};
      uint32_t color_count = 0;
 -    const uint32_t target_mask = r(reg::CB_TARGET_MASK);
++    bool must_draw = false; // port/patch_wait_compile.py: a one-time setup draw (slices, thick targets)
 +    const uint32_t target_mask = r(reg::CB_TARGET_MASK) & r(reg::CB_SHADER_MASK);
      for (uint32_t t = 0; t < 8; ++t) {
-         const uint32_t info = r(reg::CB_COLOR0_INFO + t * 4), base = r(reg::CB_COLOR0_BASE + t * 4);
+-        const uint32_t info = r(reg::CB_COLOR0_INFO + t * 4), base = r(reg::CB_COLOR0_BASE + t * 4);
++        const uint32_t info = r(reg::CB_COLOR0_INFO + t * 4);
++        uint32_t base = r(reg::CB_COLOR0_BASE + t * 4);
          if (((target_mask >> (4 * t)) & 0xF) == 0 || ((info >> 2) & 0x3F) == 0 || base == 0) continue;
-@@ -888,7 +897,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
++        // port/patch_slice_targets.py: slice z of a 3D/array surface is its own target, at base + z * slice size.
++        const uint32_t slice = r(reg::CB_COLOR0_VIEW + t * 4) & 0x7FF;
++        if (slice != 0) must_draw = true;
++        if (((info >> 8) & 0xF) == 3 || ((info >> 8) & 0xF) == 7) must_draw = true;
++        if (slice != 0 && slice_targets_enabled()) {
++            const uint32_t size_reg = r(reg::CB_COLOR0_SIZE + t * 4);
++            const uint32_t pitch = ((size_reg & 0x3FF) + 1) * 8;
++            const uint32_t height = (((size_reg >> 10) & 0xFFFFF) + 1) * 64 / pitch;
++            const uint32_t tile = (info >> 8) & 0xF;
++            const uint32_t bytes = std::max(1u, color_format(color_buffer_surface_format(info)).bytes);
++            base += slice * slice_key_bytes(pitch, height, bytes, tile) >> 8;
++            if (static const bool log = std::getenv("TTT2_LOG_TARGETS") != nullptr; log) {
++                std::fprintf(stderr, "ttt2: slice draw: cb%u base 0x%08X slice %u (frame %llu, draw %llu)\n", t,
++                             r(reg::CB_COLOR0_BASE + t * 4) << 8, slice, static_cast<unsigned long long>(frame_number_),
++                             static_cast<unsigned long long>(draws_));
++            }
++        }
+         colors[t] = color_target(base, r(reg::CB_COLOR0_SIZE + t * 4), info);
++        if (slice != 0 && colors[t] && slice_targets_enabled()) const_cast<Target*>(colors[t])->write_back = false;
+         if (colors[t]) color_count = t + 1;
+     }
++    { // port/patch_log_targets.py
++        static const char* lt = std::getenv("TTT2_LOG_TARGETS");
++        trace_this_draw_ = false;
++        for (uint32_t i = 0; lt && *lt == '3' && i < 8; ++i) {
++            if (colors[i] && (colors[i]->tile_mode == 3 || colors[i]->tile_mode == 7)) trace_this_draw_ = true;
++        }
++    }
+     const uint32_t depth_control = r(reg::DB_DEPTH_CONTROL);
+     const Target* depth = nullptr;
+     if ((depth_control & 7) != 0 && (r(reg::DB_DEPTH_INFO) & 7) != 0 && r(reg::DB_DEPTH_BASE) != 0) {
+@@ -871,6 +907,20 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     VkFormat formats[8]{};
+     for (uint32_t i = 0; i < color_count; ++i) formats[i] = colors[i] ? colors[i]->image.format : VK_FORMAT_UNDEFINED;
+     const VkFormat depth_format = depth ? depth->image.format : VK_FORMAT_UNDEFINED;
++    static const int wait_mode = [] {
++        const char* v = std::getenv("TTT2_WAIT_COMPILE");
++        return v == nullptr ? 2 : std::atoi(v);
++    }();
++    const bool wait_compile = wait_mode == 1 || (wait_mode == 2 && must_draw);
++    if (wait_compile) {
++        for (int spin = 0; spin < 20000 && (vs->module == VK_NULL_HANDLE || ps->module == VK_NULL_HANDLE) &&
++                           !vs->failed && !ps->failed;
++             ++spin) {
++            std::this_thread::sleep_for(std::chrono::microseconds(250));
++            if (vs->module == VK_NULL_HANDLE) resolve_module(*const_cast<ShaderModule*>(vs));
++            if (ps->module == VK_NULL_HANDLE) resolve_module(*const_cast<ShaderModule*>(ps));
++        }
++    }
+     if (vs->module == VK_NULL_HANDLE || ps->module == VK_NULL_HANDLE) {
+         ++deferred_draws_; // a shader still compiling
+         return;
+@@ -881,6 +931,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+         ++skipped_draws_;
+         return;
+     }
++    if (wait_compile) {
++        for (int spin = 0; spin < 40000 && pipe->state.load() == Built::kPending; ++spin) {
++            std::this_thread::sleep_for(std::chrono::microseconds(250));
++        }
++    }
+     if (pipe->state.load() != Built::kReady) {
+         ++deferred_draws_; // its pipeline still compiling
+         return;
+@@ -888,7 +943,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
  
      // Per-draw constants.
      abi::DrawConstants dc{};
@@ -708,7 +887,7 @@ index d591259..985285c 100644
      ConstantSources sources;
      for (uint32_t i = 0; i < 16; ++i) {
          if (const uint32_t a = r(reg::SQ_ALU_CONST_CACHE_VS_0 + i * 4)) {
-@@ -965,7 +974,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -965,7 +1020,8 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      if (replaying_) replace_constants(draw_index, dc);
      const VkDeviceSize ubo_align = std::max<VkDeviceSize>(ctx_.properties.limits.minUniformBufferOffsetAlignment, 16);
      VkDeviceSize dc_offset = 0;
@@ -718,7 +897,7 @@ index d591259..985285c 100644
      VkDeviceSize reg_offset[2] = {};
      if (vs->info.uses_registers) {
          std::memcpy(upload(4096, ubo_align, reg_offset[0]), &regs.value[reg::SQ_ALU_CONSTANT0_256 >> 2], 4096);
-@@ -1069,6 +1079,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1069,6 +1125,16 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          }
      }
  
@@ -735,7 +914,7 @@ index d591259..985285c 100644
      // Stream-out data a run of stream-out draws wrote, read by the draws
      // after it (skinned vertices, text): a barrier first, outside the pass.
      const bool writes_stream_out = stream_out && !replaying_;
-@@ -1186,7 +1206,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1186,7 +1252,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      }
      viewport.minDepth = std::clamp(viewport.minDepth, 0.0f, 1.0f);
      viewport.maxDepth = std::clamp(viewport.maxDepth, 0.0f, 1.0f);
@@ -749,7 +928,7 @@ index d591259..985285c 100644
      vkCmdSetViewport(c, 0, 1, &viewport);
      const uint32_t tl = r(reg::PA_SC_GENERIC_SCISSOR_TL), br = r(reg::PA_SC_GENERIC_SCISSOR_TL + 4);
      const uint32_t vtl = r(reg::PA_SC_VPORT_SCISSOR_0_TL), vbr = r(reg::PA_SC_VPORT_SCISSOR_0_TL + 4);
-@@ -1285,6 +1310,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1285,6 +1356,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          std::fprintf(stderr, "trace:   spi_ps_in 0x%08X 0x%08X interp 0x%08X vs_out_cntl 0x%08X point 0x%08X\n",
                       r(reg::SPI_PS_IN_CONTROL_0), r(reg::SPI_PS_IN_CONTROL_0 + 4), r(reg::SPI_INTERP_CONTROL_0),
                       r(reg::PA_CL_VS_OUT_CNTL), r(reg::PA_SU_POINT_SIZE));
@@ -783,7 +962,7 @@ index d591259..985285c 100644
          if (color_count == 0) {
              std::fprintf(stderr, "trace:   no color target: mask 0x%08X cb0 base 0x%08X size 0x%08X info 0x%08X control 0x%08X\n",
                           target_mask, r(reg::CB_COLOR0_BASE), r(reg::CB_COLOR0_SIZE), r(reg::CB_COLOR0_INFO),
-@@ -1302,6 +1354,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1302,6 +1400,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                           depth->address, depth->format, depth->pitch, depth->height, depth_control,
                           r(reg::DB_STENCILREFMASK), r(reg::DB_STENCILREFMASK_BF), mode);
          }
@@ -795,7 +974,7 @@ index d591259..985285c 100644
          const auto trace_textures = [&](const ShaderModule* s, uint32_t base, const char* stage) {
              for (uint32_t slot = 0; slot < abi::kTextureSlots; ++slot) {
                  if (!(s->info.texture_mask & (1u << slot))) continue;
-@@ -1313,6 +1370,17 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1313,10 +1416,52 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
                               (w[1] & 0x1FFF) + 1, ((w[1] >> 13) & 0x1FFF) + 1, w[0] & 7, (w[0] >> 3) & 0xF,
                               ((w[0] >> 8) & 0x7FF) * 8 + 8, (w[5] & 0xF) + 1, (w[4] >> 16) & 0xFFF,
                               t && t->source ? "(render target)" : "(memory)");
@@ -813,7 +992,42 @@ index d591259..985285c 100644
              }
          };
          trace_textures(vs, resource::kVsTexture, "vs");
-@@ -1325,7 +1393,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+         trace_textures(ps, resource::kPsTexture, "ps");
++        { // port/patch_trace_regs.py
++            auto dump_regs = [&](const char* which, uint32_t base, uint32_t n) {
++                for (uint32_t i = 0; i < n; ++i) {
++                    const uint32_t* v = &regs.value[(base >> 2) + i * 4];
++                    std::fprintf(stderr, "trace:   %s c[%u] %g %g %g %g (%08X %08X %08X %08X)\n", which, i,
++                                 std::bit_cast<float>(v[0]), std::bit_cast<float>(v[1]), std::bit_cast<float>(v[2]),
++                                 std::bit_cast<float>(v[3]), v[0], v[1], v[2], v[3]);
++                }
++            };
++            std::fprintf(stderr, "trace:   uses registers: vs %d ps %d, sq_config 0x%08X\n", vs->info.uses_registers ? 1 : 0,
++                         ps->info.uses_registers ? 1 : 0, r(reg::SQ_CONFIG));
++            if (vs->info.uses_registers) dump_regs("vs", reg::SQ_ALU_CONSTANT0_256, 20);
++            for (uint32_t bank = 0; bank < 16; ++bank) {
++                for (int stage = 0; stage < 2; ++stage) {
++                    const ShaderModule* sm = stage == 0 ? vs : ps;
++                    if (!((sm->info.constant_bank_mask >> bank) & 1)) continue;
++                    const uint32_t a = r((stage == 0 ? reg::SQ_ALU_CONST_CACHE_VS_0 : reg::SQ_ALU_CONST_CACHE_PS_0) + bank * 4) << 8;
++                    std::fprintf(stderr, "trace:   %s block %u at 0x%08X\n", stage == 0 ? "vs" : "ps", bank, a);
++                    if (a == 0 || !guest_memory_committed(a, 12 * 16)) continue;
++                    for (uint32_t i = 0; i < 12; ++i) {
++                        float f[4];
++                        for (int k = 0; k < 4; ++k) {
++                            uint32_t w = __builtin_bswap32(*reinterpret_cast<const uint32_t*>(guest_pointer(a + i * 16 + k * 4)));
++                            f[k] = std::bit_cast<float>(w);
++                        }
++                        std::fprintf(stderr, "trace:   %s kc(%u,%u) %g %g %g %g\n", stage == 0 ? "vs" : "ps", bank, i, f[0], f[1], f[2], f[3]);
++                    }
++                }
++            }
++            if (ps->info.uses_registers) dump_regs("ps", reg::SQ_ALU_CONSTANT0_0, 8);
++        }
+         std::fprintf(stderr, "trace:   viewport %g,%g %gx%g depth %g-%g scissor %d,%d %ux%u cull 0x%X\n", viewport.x,
+                      viewport.y, viewport.width, viewport.height, viewport.minDepth, viewport.maxDepth, scissor.offset.x,
+                      scissor.offset.y, scissor.extent.width, scissor.extent.height, mode & 7);
+@@ -1325,7 +1470,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          vkCmdBindIndexBuffer(c, ring_.buffer(), index_offset, VK_INDEX_TYPE_UINT32);
          vkCmdDrawIndexed(c, index_count, instances, 0, 0, 0);
      } else {
@@ -905,7 +1119,7 @@ index 0778742..c91b088 100644
          const double ready_at = now_seconds();
          // The lead is how long frames take from their swap until the GPU has
 diff --git a/runtime/src/gpu/vulkan/renderer.cpp b/runtime/src/gpu/vulkan/renderer.cpp
-index c70b525..eb48acc 100644
+index c70b525..d42049f 100644
 --- a/runtime/src/gpu/vulkan/renderer.cpp
 +++ b/runtime/src/gpu/vulkan/renderer.cpp
 @@ -40,10 +40,28 @@ void set_tv_height(uint32_t rows) {
@@ -955,7 +1169,15 @@ index c70b525..eb48acc 100644
      if (r != VK_SUCCESS) fatal("Vulkan: the GPU did not finish a submission (%d)", static_cast<int>(r));
  }
  
-@@ -344,12 +362,32 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
+@@ -307,6 +325,7 @@ Image Renderer::create_image(VkFormat format, VkImageAspectFlags aspect, uint32_
+     vci.viewType = view_type;
+     vci.format = format;
+     vci.subresourceRange = {aspect, 0, img.levels, 0, ici.arrayLayers};
++    if (view_type == VK_IMAGE_VIEW_TYPE_CUBE && ici.arrayLayers >= 6) vci.subresourceRange.layerCount = 6; // port/patch_cube_view.py
+     VK_CHECK(vkCreateImageView(ctx_.device, &vci, nullptr, &img.view));
+ 
+     // Every image lives in the general layout.
+@@ -344,12 +363,32 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
      const uint32_t width = std::min(scaled(buffer.surface.width, t->scale), t->image.width);
      const uint32_t height = std::min(scaled(buffer.surface.height, t->scale), t->image.height);
      Image& scan = scan_[index];
@@ -990,7 +1212,7 @@ index c70b525..eb48acc 100644
                              VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                  VK_IMAGE_USAGE_SAMPLED_BIT,
                              VK_IMAGE_VIEW_TYPE_2D);
-@@ -360,7 +398,17 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
+@@ -360,7 +399,17 @@ void Renderer::copy_to_scan_buffer(const gx2::ColorBuffer& buffer, uint32_t scan
      region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
      region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
      region.extent = {width, height, 1};
@@ -1009,7 +1231,7 @@ index c70b525..eb48acc 100644
      barrier();
      scan_valid_[index] = true;
      profile_mark("copy to scan buffer", t->address, width, height);
-@@ -377,12 +425,13 @@ void Renderer::save_image(const Image& img, const std::string& path, bool keep_a
+@@ -377,12 +426,13 @@ void Renderer::save_image(const Image& img, const std::string& path, bool keep_a
      // Formats a trace can show: 8-bit, signed 8-bit, 10-bit, half float and
      // depth, decoded to RGBA in [0, 1] (signed and HDR values clamped; the
      // stats line has the real mean and peak).
@@ -1024,7 +1246,7 @@ index c70b525..eb48acc 100644
      case VK_FORMAT_R16G16B16A16_SFLOAT: kind = Kind::kHalf; break;
      case VK_FORMAT_R16G16_UNORM: kind = Kind::kRg16; break;
      case VK_FORMAT_R16G16B16A16_SNORM: kind = Kind::kSnorm16; break;
-@@ -429,6 +478,21 @@ void Renderer::save_image(const Image& img, const std::string& path, bool keep_a
+@@ -429,6 +479,21 @@ void Renderer::save_image(const Image& img, const std::string& path, bool keep_a
              c[3] = (w >> 30) / 3.0f;
              break;
          }
@@ -1047,7 +1269,7 @@ index c70b525..eb48acc 100644
              uint16_t h[4];
              std::memcpy(h, t, 8);
 diff --git a/runtime/src/gpu/vulkan/renderer.h b/runtime/src/gpu/vulkan/renderer.h
-index 6739e5d..ba9dee8 100644
+index 6739e5d..33b5219 100644
 --- a/runtime/src/gpu/vulkan/renderer.h
 +++ b/runtime/src/gpu/vulkan/renderer.h
 @@ -244,6 +244,7 @@ private:
@@ -1058,7 +1280,26 @@ index 6739e5d..ba9dee8 100644
      };
      std::vector<Target*> write_back_targets_; // written since the last submission
      std::mutex write_back_mutex_;             // the members below: the retirement thread uses them too
-@@ -339,6 +340,10 @@ private:
+@@ -257,6 +258,18 @@ private:
+     void load_texture(Texture& t);
+     void mark_textures_dirty(uint32_t address, uint64_t end);
+     bool load_texture_from_targets(Texture& t);
++    // port/patch_slice_targets.py
++    static bool slice_targets_enabled() {
++        static const bool on = [] {
++            const char* v = std::getenv("TTT2_SLICE_TARGETS");
++            return v == nullptr || *v != '0';
++        }();
++        return on;
++    }
++    static uint32_t slice_key_bytes(uint32_t pitch, uint32_t height, uint32_t bytes, uint32_t tile_mode) {
++        const uint32_t align = tile_mode >= 4 ? 0x800u : 0x100u;
++        return (pitch * height * bytes + align - 1) & ~(align - 1);
++    }
+     void copy_depth_to_texture(const Target& src, Texture& t, uint32_t width, uint32_t height);
+     VkSampler sampler(const uint32_t words[3], const float border[4], bool compare);
+     Buffer depth_staging_; // video memory for depth -> texture copies
+@@ -339,6 +352,10 @@ private:
      void record_constants(uint32_t draw_index, const ConstantSources& sources, latte::abi::DrawConstants& dc);
      void replace_constants(uint32_t draw_index, latte::abi::DrawConstants& dc);
      uint32_t frames_per_frame_ = 1; // frames shown per frame the title renders
@@ -1069,8 +1310,18 @@ index 6739e5d..ba9dee8 100644
      bool uncapped_ = false;         // as many of those as the GPU keeps up with, presented without pacing or vsync
      bool replaying_ = false;
      bool replayed_ = false; // this frame's extra frames were rendered
+@@ -576,7 +593,8 @@ private:
+     std::vector<VkSemaphore> rendered_;
+ 
+     // TTT2_TRACE_FRAME=n: log every command of frame n (counted from 0).
+-    bool tracing() const { return frame_number_ == trace_frame_; }
++    bool tracing() const { return frame_number_ == trace_frame_ || trace_this_draw_; }
++    bool trace_this_draw_ = false; // port/patch_log_targets.py: TTT2_LOG_TARGETS=3 traces draws into tile-3 (thick) targets
+     uint64_t frame_number_ = 0;
+     uint64_t trace_frame_ = UINT64_MAX;
+ 
 diff --git a/runtime/src/gpu/vulkan/targets.cpp b/runtime/src/gpu/vulkan/targets.cpp
-index 5bd50e6..664ad5f 100644
+index 5bd50e6..5becc96 100644
 --- a/runtime/src/gpu/vulkan/targets.cpp
 +++ b/runtime/src/gpu/vulkan/targets.cpp
 @@ -10,7 +10,13 @@
@@ -1087,7 +1338,18 @@ index 5bd50e6..664ad5f 100644
  #include <cstdio>
  #include <cstdlib>
  #include <cstring>
-@@ -181,8 +187,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
+@@ -81,6 +87,10 @@ Target* Renderer::color_target(uint32_t base_reg, uint32_t size_reg, uint32_t in
+         reported = format;
+         return nullptr;
+     }
++    if (static const bool log = std::getenv("TTT2_LOG_TARGETS") != nullptr; log) { // port/patch_log_targets.py
++        std::fprintf(stderr, "ttt2: new colour target 0x%08X fmt 0x%03X %ux%u tile %u (frame %llu)\n", address, format,
++                     pitch, height, tile_mode, static_cast<unsigned long long>(frame_number_));
++    }
+     auto t = std::make_unique<Target>();
+     t->address = address;
+     t->format = format;
+@@ -181,8 +191,13 @@ void Renderer::refit_target(Target& t, float scale, uint32_t min_width, uint32_t
      barrier();
      VkImageBlit blit{};
      blit.srcSubresource = blit.dstSubresource = {old.aspect, 0, 0, 1};
@@ -1103,7 +1365,7 @@ index 5bd50e6..664ad5f 100644
      vkCmdBlitImage(cmd(), old.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
                     t.depth || scale == t.scale ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
      barrier();
-@@ -245,6 +256,44 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
+@@ -245,6 +260,44 @@ void Renderer::clear_depth_stencil(const Registers&, const gx2::DepthBuffer& buf
      profile_mark("clear depth", t->address, t->image.width, t->image.height);
      t->written = stamp();
      note_target_written(t);
@@ -1148,7 +1410,7 @@ index 5bd50e6..664ad5f 100644
      if (tracing()) {
          std::fprintf(stderr, "trace: clear depth 0x%08X fmt 0x%03X %ux%u flags %u (%g, %u)\n", t->address, t->format,
                       t->pitch, t->height, flags, depth, stencil);
-@@ -420,6 +469,18 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
+@@ -420,6 +473,18 @@ void Renderer::convert_depth(const gx2::DepthBuffer& src, const gx2::Surface& ds
  // ------------------------------------------------------------ write-back
  
  void Renderer::queue_write_back(Target* t) {
@@ -1167,7 +1429,7 @@ index 5bd50e6..664ad5f 100644
      if (!t->write_back || replaying_ || t->write_back_queued) return;
      t->write_back_queued = true;
      write_back_targets_.push_back(t);
-@@ -438,9 +499,20 @@ void Renderer::copy_write_backs() {
+@@ -438,9 +503,20 @@ void Renderer::copy_write_backs() {
          if (!guest_memory_committed(t->address, t->pitch * t->height * bytes)) continue;
          if (write_back_free_.empty()) {
              write_back_free_.push_back(static_cast<uint32_t>(write_back_staging_.size()));
@@ -1191,7 +1453,7 @@ index 5bd50e6..664ad5f 100644
          }
          const uint32_t staging = write_back_free_.back();
          write_back_free_.pop_back();
-@@ -449,7 +521,21 @@ void Renderer::copy_write_backs() {
+@@ -449,7 +525,21 @@ void Renderer::copy_write_backs() {
          region.imageExtent = {t->pitch, t->height, 1};
          vkCmdCopyImageToBuffer(cmd(), t->image.image, VK_IMAGE_LAYOUT_GENERAL, write_back_staging_[staging].buffer, 1,
                                 &region);
@@ -1214,7 +1476,7 @@ index 5bd50e6..664ad5f 100644
          if (tracing()) {
              std::fprintf(stderr, "trace: write back 0x%08X fmt 0x%03X %ux%u tile %u\n", t->address, t->format, t->pitch,
                           t->height, t->tile_mode);
-@@ -472,6 +558,19 @@ void Renderer::copy_write_backs() {
+@@ -472,6 +562,19 @@ void Renderer::copy_write_backs() {
  // (Retirement thread.) The copies of the submissions up to `value`, tiled
  // into guest memory.
  void Renderer::retired(uint64_t value) {
@@ -1234,7 +1496,7 @@ index 5bd50e6..664ad5f 100644
      for (;;) {
          WriteBack w;
          const uint8_t* data;
-@@ -482,6 +581,39 @@ void Renderer::retired(uint64_t value) {
+@@ -482,6 +585,39 @@ void Renderer::retired(uint64_t value) {
              write_backs_.pop_front();
              data = write_back_staging_[w.staging].mapped;
          }
@@ -1274,7 +1536,7 @@ index 5bd50e6..664ad5f 100644
          TiledLevel level{};
          level.data = guest_pointer(w.address);
          level.base256b = w.base_reg;
-@@ -492,8 +624,15 @@ void Renderer::retired(uint64_t value) {
+@@ -492,8 +628,15 @@ void Renderer::retired(uint64_t value) {
          level.slices = 1;
          level.samples = 1;
          tile(level, w.pitch, w.height, 0, 1, data);
@@ -1290,6 +1552,60 @@ index 5bd50e6..664ad5f 100644
      }
  }
  
+diff --git a/runtime/src/gpu/vulkan/textures.cpp b/runtime/src/gpu/vulkan/textures.cpp
+index f5d0d7b..649d2c5 100644
+--- a/runtime/src/gpu/vulkan/textures.cpp
++++ b/runtime/src/gpu/vulkan/textures.cpp
+@@ -273,6 +273,24 @@ bool Renderer::load_texture_from_targets(Texture& t) {
+         note_target_read(src);
+         newest = std::max(newest, src->written);
+     }
++    // port/patch_slice_targets.py: the other slices of a 3D/array texture, from their slice targets.
++    const Target* slice_sources[14][64] = {}; // port/patch_slice_levels.py: per level
++    const uint32_t slice_count = r.depth > 1 && !f.compressed && slice_targets_enabled() ? std::min(r.depth, 64u) : 0;
++    for (uint32_t level = 0; slice_count > 1 && level < levels; ++level) {
++        const Target* s0 = sources[level];
++        if (s0 == nullptr) continue;
++        const uint32_t step = slice_key_bytes(s0->pitch, s0->height, std::max(1u, f.bytes), s0->tile_mode);
++        for (uint32_t z = 1; z < slice_count; ++z) {
++            const Target* src = find_target(s0->address + z * step, 0, false);
++            if (src == nullptr || src->written <= src->overwritten || src->pitch != s0->pitch ||
++                src->height != s0->height || src->scale != s0->scale || color_format(src->format).bytes != f.bytes) {
++                continue;
++            }
++            slice_sources[level][z] = src;
++            note_target_read(src);
++            newest = std::max(newest, src->written);
++        }
++    }
+     if (t.source == sources[0] && t.loaded >= newest && t.scale == sources[0]->scale) return true;
+     // An upscaled target gives an upscaled texture; levels of another scale
+     // than level 0 are left out.
+@@ -303,6 +321,24 @@ bool Renderer::load_texture_from_targets(Texture& t) {
+         vkCmdCopyImage(cmd(), src->image.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1,
+                        &region);
+     }
++    for (uint32_t level = 0; slice_count > 1 && level < levels; ++level) { // port/patch_slice_levels.py
++        const bool is_3d = r.dim == gx2::kDim3D;
++        // a 3D texture's levels also halve in depth
++        const uint32_t level_slices = is_3d ? std::max(1u, slice_count >> level) : slice_count;
++        for (uint32_t z = 1; z < level_slices; ++z) {
++            const Target* src = slice_sources[level][z];
++            if (src == nullptr || src->scale != scale) continue;
++            const uint32_t width = std::min(scaled(std::max(1u, r.width >> level), scale), std::max(1u, t.image.width >> level));
++            const uint32_t height = std::min(scaled(std::max(1u, r.height >> level), scale), std::max(1u, t.image.height >> level));
++            VkImageCopy region{};
++            region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++            region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, is_3d ? 0u : z, 1};
++            region.dstOffset = {0, 0, is_3d ? static_cast<int32_t>(z) : 0};
++            region.extent = {std::min(width, src->image.width), std::min(height, src->image.height), 1};
++            vkCmdCopyImage(cmd(), src->image.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1,
++                           &region);
++        }
++    }
+     barrier();
+     profile_mark("texture from target", sources[0]->address, scaled(r.width, scale), scaled(r.height, scale));
+     t.source = sources[0];
 diff --git a/runtime/src/gx2/cbpool.cpp b/runtime/src/gx2/cbpool.cpp
 index 09327e6..699483d 100644
 --- a/runtime/src/gx2/cbpool.cpp
@@ -1636,6 +1952,21 @@ index e8d1b9e..f7b6819 100644
      bool point_size_export = false; // PA_CL_VS_OUT_CNTL.USE_VTX_POINT_SIZE
      uint8_t stream_out_mask = 0;    // buffers with stream-out writes enabled
      uint16_t stream_out_stride[4] = {}; // bytes per vertex
+diff --git a/runtime/src/memory.cpp b/runtime/src/memory.cpp
+index cec93d5..5217d87 100644
+--- a/runtime/src/memory.cpp
++++ b/runtime/src/memory.cpp
+@@ -37,6 +37,10 @@ std::pair<uint64_t, uint64_t> page_span(uint32_t address, uint32_t size) {
+ 
+ uint8_t* guest_base() { return g_base; }
+ 
++namespace ppc {
++uint32_t g_reserve_lines[4096]{}; // port/patch_reservation.py
++}
++
+ void reserve_guest_memory() {
+     if (g_base != nullptr) {
+         return;
 diff --git a/runtime/src/os/ax.cpp b/runtime/src/os/ax.cpp
 index efe3675..6df66b3 100644
 --- a/runtime/src/os/ax.cpp
@@ -2546,10 +2877,31 @@ index 852f5d4..d68e479 100644
      static constexpr Setting kSettings[] = {
          {"cafe.language", kLanguageEnglish},
 diff --git a/runtime/src/os/thread.cpp b/runtime/src/os/thread.cpp
-index 903c088..ac89d12 100644
+index 903c088..55c9e3f 100644
 --- a/runtime/src/os/thread.cpp
 +++ b/runtime/src/os/thread.cpp
-@@ -298,6 +298,11 @@ void* host_main(void* argument) {
+@@ -247,6 +247,20 @@ void run_profile(double start, double seconds, std::string path) {
+ }
+ 
+ void start_profiler() {
++    // port/patch_fault_threads.py: all threads at a fault.
++    g_fault_threads_hook = [](const PPCContext* faulting) {
++        KernelLock lock(g_kernel, std::try_to_lock);
++        std::fprintf(stderr, "\nother guest threads at the fault%s:\n", lock.owns_lock() ? "" : " (kernel lock busy)");
++        for (const auto& [guest, t] : g_threads) {
++            if (&t->ctx == faulting) continue;
++            const uint32_t name = field<uint32_t>(guest, kName);
++            std::fprintf(stderr, "thread %08X \"%s\" core %d prio %d state %u:\n", guest,
++                         name ? std::string(guest_string(name)).c_str() : "", t->core,
++                         field<int32_t>(guest, kEffectivePriority), state_of(guest));
++            dump_backtrace(t->ctx);
++        }
++        std::fflush(stderr);
++    };
+     // TTT2_DUMP_THREADS_AT=seconds: then, each guest thread's name and where it is in guest code
+     // (its last call out: the LR and the saved return addresses), for finding what a title waits on.
+     if (const char* at = std::getenv("TTT2_DUMP_THREADS_AT")) {
+@@ -298,6 +312,11 @@ void* host_main(void* argument) {
      if (setjmp(t->exit_jump) == 0) {
          const uint32_t entry = field<uint32_t>(t->guest, kEntry);
          if (t == g_main_thread && g_preinit_user != 0) run_preinit_user(t->ctx, g_preinit_user);
@@ -2561,7 +2913,7 @@ index 903c088..ac89d12 100644
          cafe_ppc_lookup(entry)(t->ctx, guest_base());
          exit_value = t->ctx.r[3];
      } else {
-@@ -534,7 +539,14 @@ int32_t OSResumeThread(GuestAddress thread) {
+@@ -534,7 +553,14 @@ int32_t OSResumeThread(GuestAddress thread) {
          suspend = previous - 1;
          if (previous == 1 && !t->host_started) {
              set_state(thread.value, kRunning);
@@ -2576,7 +2928,7 @@ index 903c088..ac89d12 100644
          }
      }
      return previous;
-@@ -635,7 +647,85 @@ uint32_t OSGetCoreCount() { return 3; }
+@@ -635,7 +661,85 @@ uint32_t OSGetCoreCount() { return 3; }
  
  // The main thread is core 1's default thread.
  // shortcut: cores 0 and 2 have no default thread (0); create them if a title runs work on them (OSRunThread).
@@ -2663,7 +3015,7 @@ index 903c088..ac89d12 100644
  
  uint32_t OSSetThreadDeallocator(GuestAddress thread, uint32_t deallocator) {
      be<uint32_t>& slot = field<uint32_t>(thread.value, kDeallocator);
-@@ -687,6 +777,9 @@ CAFE_EXPORT(coreinit, OSSetThreadSpecific, OSSetThreadSpecific);
+@@ -687,6 +791,9 @@ CAFE_EXPORT(coreinit, OSSetThreadSpecific, OSSetThreadSpecific);
  CAFE_EXPORT(coreinit, OSGetThreadSpecific, OSGetThreadSpecific);
  CAFE_EXPORT(coreinit, OSGetCoreCount, OSGetCoreCount);
  CAFE_EXPORT(coreinit, OSGetDefaultThread, OSGetDefaultThread);
