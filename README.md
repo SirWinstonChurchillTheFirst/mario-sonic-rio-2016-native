@@ -7,22 +7,26 @@ translated to C++ ahead of time and runs on a reimplementation of the Wii U's sy
 > unpacked to `code/`, `content/`, `meta/`. The translated C++ and the program built from it contain the game's
 > code: do not share them. Not affiliated with or endorsed by Nintendo, SEGA or the IOC.
 
-## Status (19 November 2026): does not reach gameplay
+## Status (22 November 2026): hub town, menus and character select run, 60 frames/s on a Batocera console
 
 | Step | State |
 | --- | --- |
-| Translate `unison.rpx` (84,281 functions, 4.87 million instructions) | works |
-| Build with the runtime | works on Windows (clang, MSYS2) and Linux |
-| Start-up, Rio 2016 logo and copyright screen | shown correctly |
-| Autosave notice, accepted with A | works (text needs a system font, see below) |
-| "Now loading..." after the title | reached, then the game stops with a null access (guest address 0x4, at `0x0215B4FC`) |
-| Menus, events, gameplay | **not reached** |
-| Sound | a device is opened; nothing has been listened to. Reverb, chorus and delay effects are not computed |
-| Speed | on a GeForce RTX 3070 Ti (Windows build) the renderer needs 1.3 to 2.9 ms per frame up to the loading picture |
+| Logo, save notice, map, "Now loading...", the hub town (Copacabana) with your Mii walking, dialogs | works (PC and console) |
+| Discipline and character select | works |
+| An event (match) | **not verified**: two of seven PC test runs ended in a guest fault inside the title's multi-threaded renderer (`hh::rsdx`, null or wild shader-parameter pointer), likely a threading race; the console run (160 s, menus) had none |
+| Speed | console (Ryzen 3 4350GE, Vega 6): 59.9 frames/s in the menus; CPU 71 C, GPU 61 C |
+| Sound | works |
 
-Known gaps: the game asks for the console's Mii data files (`FFLResMiddle.dat`, `FFLResHigh.dat`), which are not
-part of a game dump; `GX2ResetGPU` does nothing; `GX2CopySurfaceEx` copies whole surfaces only; online services
-answer "offline".
+**Miis.** The game needs the Wii U's Mii resources (system title `0005001B-10056000`: `FFLResMiddle.dat`,
+`FFLResHigh.dat`). They are **not** part of the game and **not** included here: visible Miis need the Mii resource
+title from your own Wii U. Point `CAFE_SYS_DIR` at a Cemu-style `mlc01/sys` folder that holds
+`title/0005001b/10056000/content/` (the console launcher uses `/userdata/saves/wiiu/sys` when it exists). The account
+Mii comes from `CAFE_ACCOUNT_DAT` (a Cemu `account.dat`) or is a generated default Mii. The Mii databases
+(`FFL_ODB.dat`, `FFL_HDB.dat`) are made empty in the port's own save folder.
+
+What made it run past the loading screen (all in `port/`): `patch_sys_dir.py`, `patch_mlc_usr.py` (Mii Maker's shared
+save and its title id), `patch_default_mii.py`, `patch_ffl_odb.py` (an empty Mii database as FFL itself writes one; the
+game treats FFL's "database was just created" result as a failure).
 
 ## What is here
 
